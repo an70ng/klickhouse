@@ -9,6 +9,40 @@ use time::OffsetDateTime;
 
 use crate::{Client, KlickhouseError, Result, Row, Type, Value};
 
+/// Specialized client handle for a Clickhouse connection to run database migrations.
+#[derive(Clone)]
+pub struct MigrationClient {
+    inner: Client,
+    options: MigrationOptions,
+}
+
+impl MigrationClient {
+    pub fn new(client: Client, options: MigrationOptions) -> Self {
+        Self {
+            inner: client,
+            options,
+        }
+    }
+}
+
+/// Options set for running migrations.
+#[derive(Debug, Clone)]
+pub struct MigrationOptions {
+    pub migration_lock_sync: bool,
+    pub migration_lock_ttl: Duration,
+    pub migration_lock_name: String,
+}
+
+impl Default for MigrationOptions {
+    fn default() -> Self {
+        Self {
+            migration_lock_ttl: Duration::from_secs(60),
+            migration_lock_sync: true,
+            migration_lock_name: "refinery_exec".to_string(),
+        }
+    }
+}
+
 impl Row for Migration {
     const COLUMN_COUNT: Option<usize> = Some(4);
 
@@ -116,21 +150,22 @@ impl Row for Migration {
 }
 
 #[async_trait::async_trait]
-impl AsyncTransaction for Client {
+impl AsyncTransaction for MigrationClient {
     type Error = KlickhouseError;
 
     async fn execute<'a, T: Iterator<Item = &'a str> + Send>(
         &mut self,
         queries: T,
     ) -> Result<usize, Self::Error> {
-        let lock = ClickhouseLock::new(self.clone(), "refinery_exec");
+        let lock = ClickhouseLock::new(self.inner.clone(), &self.options.migration_lock_name)
+            .with_sync(self.options.migration_lock_sync);
         let start = Instant::now();
         let handle = loop {
             if let Some(handle) = lock.try_lock().await? {
                 break handle;
             } else {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                if start.elapsed() > Duration::from_secs(60) {
+                if start.elapsed() > self.options.migration_lock_ttl {
                     lock.reset().await?;
                 }
             }
@@ -145,7 +180,7 @@ impl AsyncTransaction for Client {
                 if query.is_empty() {
                     continue;
                 }
-                Client::execute(self, query).await?;
+                Client::execute(&self.inner, query).await?;
             }
         }
         handle.unlock().await?;
@@ -154,16 +189,16 @@ impl AsyncTransaction for Client {
 }
 
 #[async_trait::async_trait]
-impl AsyncQuery<Vec<Migration>> for Client {
+impl AsyncQuery<Vec<Migration>> for MigrationClient {
     async fn query(
         &mut self,
         query: &str,
     ) -> Result<Vec<Migration>, <Self as AsyncTransaction>::Error> {
-        self.query_collect::<Migration>(query).await
+        self.inner.query_collect::<Migration>(query).await
     }
 }
 
-impl AsyncMigrate for Client {
+impl AsyncMigrate for MigrationClient {
     fn assert_migrations_table_query(migration_table_name: &str) -> String {
         format!(
             "CREATE TABLE IF NOT EXISTS {migration_table_name}(
@@ -180,14 +215,14 @@ pub trait ClusterName: Send + Sync {
     fn database() -> String;
 }
 
-/// Wrapper for Client to use migrations on clusters
+/// Wrapper for MigrationClient to use migrations on clusters
 pub struct ClusterMigration<T: ClusterName> {
-    client: Client,
+    client: MigrationClient,
     _t: PhantomData<T>,
 }
 
 impl<T: ClusterName> ClusterMigration<T> {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: MigrationClient) -> Self {
         Self {
             client,
             _t: Default::default(),
@@ -202,15 +237,19 @@ impl<TT: ClusterName> AsyncTransaction for ClusterMigration<TT> {
         &mut self,
         queries: T,
     ) -> Result<usize, Self::Error> {
-        let lock = ClickhouseLock::new(self.client.clone(), "refinery_exec")
-            .with_cluster(TT::cluster_name());
+        let lock = ClickhouseLock::new(
+            self.client.inner.clone(),
+            &self.client.options.migration_lock_name,
+        )
+        .with_cluster(TT::cluster_name())
+        .with_sync(self.client.options.migration_lock_sync);
         let start = Instant::now();
         let handle = loop {
             if let Some(handle) = lock.try_lock().await? {
                 break handle;
             } else {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                if start.elapsed() > Duration::from_secs(60) {
+                if start.elapsed() > self.client.options.migration_lock_ttl {
                     lock.reset().await?;
                 }
             }
@@ -219,7 +258,7 @@ impl<TT: ClusterName> AsyncTransaction for ClusterMigration<TT> {
         for query in queries {
             n += 1;
             for query in query_parser::split_query_statements(query) {
-                Client::execute(&self.client, query).await?;
+                Client::execute(&self.client.inner, query).await?;
             }
         }
         handle.unlock().await?;
@@ -233,7 +272,7 @@ impl<T: ClusterName> AsyncQuery<Vec<Migration>> for ClusterMigration<T> {
         &mut self,
         query: &str,
     ) -> Result<Vec<Migration>, <Self as AsyncTransaction>::Error> {
-        <Client as AsyncQuery<Vec<Migration>>>::query(&mut self.client, query).await
+        <MigrationClient as AsyncQuery<Vec<Migration>>>::query(&mut self.client, query).await
     }
 }
 

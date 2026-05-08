@@ -9,6 +9,7 @@ use crate::{Client, KlickhouseError};
 pub struct ClickhouseLock {
     name: String,
     cluster_str: String,
+    sync: bool,
     client: Client,
 }
 
@@ -24,11 +25,17 @@ impl ClickhouseLock {
             name: name.as_ref().to_string(),
             client,
             cluster_str: String::new(),
+            sync: true,
         }
     }
 
     pub fn with_cluster(mut self, cluster: impl AsRef<str>) -> Self {
         self.cluster_str = format!(" ON CLUSTER {}", cluster.as_ref());
+        self
+    }
+
+    pub fn with_sync(mut self, sync: bool) -> Self {
+        self.sync = sync;
         self
     }
 
@@ -82,8 +89,10 @@ impl ClickhouseLock {
     pub async fn reset(&self) -> Result<(), KlickhouseError> {
         self.client
             .execute(format!(
-                "DROP TABLE IF EXISTS _lock_{}{} SYNC",
-                self.name, self.cluster_str
+                "DROP TABLE IF EXISTS _lock_{}{}{}",
+                self.name,
+                self.cluster_str,
+                if self.sync { " SYNC" } else { "" },
             ))
             .await
     }
