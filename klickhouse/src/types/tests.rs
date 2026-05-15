@@ -335,18 +335,35 @@ async fn roundtrip_string() {
         Value::string("TESTST"),
         Value::string("日本語"),
     ];
+    let values_fixed32 = &[
+        Value::string("\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"),
+        Value::string("t\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"),
+        Value::string("test\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"),
+        Value::string("TESTST\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"),
+        Value::String(
+            b"\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+                .to_vec(),
+        ),
+    ];
+    let values_fixed3 = &[
+        Value::string("\0\0\0"),
+        Value::string("t\0\0"),
+        Value::string("tes"),
+        Value::string("TES"),
+        Value::String(b"\xE6\x97\xA5".to_vec()),
+    ];
     assert_eq!(
         &values[..],
         roundtrip_values(&Type::String, &values[..]).await.unwrap()
     );
     assert_eq!(
-        &values[..],
+        &values_fixed32[..],
         roundtrip_values(&Type::FixedString(32), &values[..])
             .await
             .unwrap()
     );
-    assert_ne!(
-        &values[..],
+    assert_eq!(
+        &values_fixed3[..],
         roundtrip_values(&Type::FixedString(3), &values[..])
             .await
             .unwrap()

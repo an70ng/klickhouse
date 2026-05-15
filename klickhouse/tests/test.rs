@@ -115,7 +115,7 @@ async fn test_client() {
 
     println!("begin insert");
 
-    let block = TestType {
+    let mut block = TestType {
         d_ip4: "5.6.7.8".parse::<Ipv4Addr>().unwrap().into(),
         d_ip6: "ff26:0:0:0:0:0:0:c5".parse::<Ipv6Addr>().unwrap().into(),
         d_low_card_array: vec!["te1ssdsdsdsdasdasdasdsadt".to_string(), "te2st".to_string()],
@@ -126,6 +126,7 @@ async fn test_client() {
         .await
         .unwrap();
 
+    block.d_fstring = "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0".to_string();
     let block2 = client.query_one("SELECT * from test_types").await.unwrap();
     assert_eq!(block, block2);
 

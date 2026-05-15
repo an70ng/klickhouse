@@ -28,8 +28,6 @@ impl Deserializer for StringDeserializer {
                     let mut buf = Vec::with_capacity(*n);
                     unsafe { buf.set_len(*n) };
                     reader.read_exact(&mut buf[..]).await?;
-                    let first_null = buf.iter().position(|x| *x == 0).unwrap_or(buf.len());
-                    buf.truncate(first_null);
                     out.push(Value::String(buf));
                 }
                 Ok(out)
