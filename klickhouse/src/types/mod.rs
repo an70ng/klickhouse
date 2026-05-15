@@ -221,11 +221,9 @@ fn parse_args(input: &str) -> Result<Vec<&str>> {
     // todo: handle parens in enum strings?
     for (i, c) in input.char_indices() {
         match c {
-            ',' => {
-                if in_parens == 0 {
-                    out.push(input[last_start..i].trim());
-                    last_start = i + 1;
-                }
+            ',' if in_parens == 0 => {
+                out.push(input[last_start..i].trim());
+                last_start = i + 1;
             }
             '(' => {
                 in_parens += 1;
@@ -880,34 +878,28 @@ impl Type {
 
     pub(crate) fn validate(&self) -> Result<()> {
         match self {
-            Type::Decimal32(precision) => {
-                if *precision == 0 || *precision > 9 {
-                    return Err(KlickhouseError::TypeParseError(format!(
-                        "precision out of bounds for Decimal32({}) must be in range (1..=9)",
-                        *precision
-                    )));
-                }
+            Type::Decimal32(precision) if *precision == 0 || *precision > 9 => {
+                return Err(KlickhouseError::TypeParseError(format!(
+                    "precision out of bounds for Decimal32({}) must be in range (1..=9)",
+                    *precision
+                )));
             }
-            Type::DateTime64(precision, _) | Type::Decimal64(precision) => {
-                if *precision == 0 || *precision > 18 {
-                    return Err(KlickhouseError::TypeParseError(format!("precision out of bounds for Decimal64/DateTime64({}) must be in range (1..=18)", *precision)));
-                }
+            Type::DateTime64(precision, _) | Type::Decimal64(precision)
+                if *precision == 0 || *precision > 18 =>
+            {
+                return Err(KlickhouseError::TypeParseError(format!("precision out of bounds for Decimal64/DateTime64({}) must be in range (1..=18)", *precision)));
             }
-            Type::Decimal128(precision) => {
-                if *precision == 0 || *precision > 38 {
-                    return Err(KlickhouseError::TypeParseError(format!(
-                        "precision out of bounds for Decimal128({}) must be in range (1..=38)",
-                        *precision
-                    )));
-                }
+            Type::Decimal128(precision) if *precision == 0 || *precision > 38 => {
+                return Err(KlickhouseError::TypeParseError(format!(
+                    "precision out of bounds for Decimal128({}) must be in range (1..=38)",
+                    *precision
+                )));
             }
-            Type::Decimal256(precision) => {
-                if *precision == 0 || *precision > 76 {
-                    return Err(KlickhouseError::TypeParseError(format!(
-                        "precision out of bounds for Decimal256({}) must be in range (1..=76)",
-                        *precision
-                    )));
-                }
+            Type::Decimal256(precision) if *precision == 0 || *precision > 76 => {
+                return Err(KlickhouseError::TypeParseError(format!(
+                    "precision out of bounds for Decimal256({}) must be in range (1..=76)",
+                    *precision
+                )));
             }
             Type::LowCardinality(inner) => match inner.strip_null() {
                 Type::String
