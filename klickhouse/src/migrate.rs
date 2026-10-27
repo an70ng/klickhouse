@@ -1,15 +1,41 @@
-use crate::{query_parser, ClickhouseLock, FromSql};
-use refinery_core::traits::r#async::{AsyncMigrate, AsyncQuery, AsyncTransaction};
+use crate::lock::ClickhouseLockHandle;
+use crate::{ClickhouseLock, FromSql, query_parser};
 use refinery_core::Migration;
+use refinery_core::traits::r#async::{AsyncMigrate, AsyncQuery, AsyncTransaction};
 use std::borrow::Cow;
-use std::marker::PhantomData;
 use std::time::{Duration, Instant};
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::{Client, KlickhouseError, Result, Row, Type, Value};
 
-/// Specialized client handle for a Clickhouse connection to run database migrations.
+/// Options for running migrations.
+#[derive(Debug, Clone)]
+pub struct MigrationOptions {
+    /// Name of the lock table guarding concurrent migration runs; distinct
+    /// applications sharing one server should use distinct names.
+    pub migration_lock_name: String,
+    /// Drop the lock table with `SYNC` when forcefully resetting it.
+    pub migration_lock_sync: bool,
+    /// How long a lock may be held before it is considered stale and reset.
+    pub migration_lock_ttl: Duration,
+}
+
+impl Default for MigrationOptions {
+    fn default() -> Self {
+        Self {
+            migration_lock_name: DEFAULT_LOCK_NAME.to_string(),
+            migration_lock_sync: true,
+            migration_lock_ttl: DEFAULT_LOCK_TTL,
+        }
+    }
+}
+
+const DEFAULT_LOCK_NAME: &str = "refinery_exec";
+const DEFAULT_LOCK_TTL: Duration = Duration::from_secs(60);
+
+/// Specialized client handle for running database migrations with explicit
+/// [`MigrationOptions`]; a bare [`Client`] runs them with the defaults.
 #[derive(Clone)]
 pub struct MigrationClient {
     inner: Client,
@@ -23,23 +49,10 @@ impl MigrationClient {
             options,
         }
     }
-}
 
-/// Options set for running migrations.
-#[derive(Debug, Clone)]
-pub struct MigrationOptions {
-    pub migration_lock_sync: bool,
-    pub migration_lock_ttl: Duration,
-    pub migration_lock_name: String,
-}
-
-impl Default for MigrationOptions {
-    fn default() -> Self {
-        Self {
-            migration_lock_ttl: Duration::from_secs(60),
-            migration_lock_sync: true,
-            migration_lock_name: "refinery_exec".to_string(),
-        }
+    fn lock(&self) -> ClickhouseLock {
+        ClickhouseLock::new(self.inner.clone(), &self.options.migration_lock_name)
+            .with_sync(self.options.migration_lock_sync)
     }
 }
 
@@ -149,56 +162,72 @@ impl Row for Migration {
     }
 }
 
+/// Acquires the global migration lock, forcefully resetting it if it's been held for over `ttl`.
+async fn acquire_lock(lock: &ClickhouseLock, ttl: Duration) -> Result<ClickhouseLockHandle<'_>> {
+    let start = Instant::now();
+    loop {
+        if let Some(handle) = lock.try_lock().await? {
+            return Ok(handle);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if start.elapsed() > ttl {
+            lock.reset().await?;
+        }
+    }
+}
+
+/// Runs each migration's statements in order, holding `lock` (if any) for the duration.
+async fn execute_migrations<'a, T: Iterator<Item = &'a str> + Send>(
+    client: &Client,
+    lock: Option<ClickhouseLock>,
+    lock_ttl: Duration,
+    queries: T,
+    substitute: impl Fn(&str) -> String + Send + Sync,
+) -> Result<usize> {
+    let handle = match &lock {
+        Some(lock) => Some(acquire_lock(lock, lock_ttl).await?),
+        None => None,
+    };
+    let mut n = 0;
+    for query in queries {
+        n += 1;
+        for query in query_parser::split_query_statements(query) {
+            if query.is_empty() {
+                continue;
+            }
+            Client::execute(client, substitute(&query)).await?;
+        }
+    }
+    if let Some(handle) = handle {
+        handle.unlock().await?;
+    }
+    Ok(n)
+}
+
 #[async_trait::async_trait]
-impl AsyncTransaction for MigrationClient {
+impl AsyncTransaction for Client {
     type Error = KlickhouseError;
 
     async fn execute<'a, T: Iterator<Item = &'a str> + Send>(
         &mut self,
         queries: T,
     ) -> Result<usize, Self::Error> {
-        let lock = ClickhouseLock::new(self.inner.clone(), &self.options.migration_lock_name)
-            .with_sync(self.options.migration_lock_sync);
-        let start = Instant::now();
-        let handle = loop {
-            if let Some(handle) = lock.try_lock().await? {
-                break handle;
-            } else {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                if start.elapsed() > self.options.migration_lock_ttl {
-                    lock.reset().await?;
-                }
-            }
-        };
-        let mut n = 0;
-        for query in queries {
-            n += 1;
-            if query.is_empty() {
-                continue;
-            }
-            for query in query_parser::split_query_statements(query) {
-                if query.is_empty() {
-                    continue;
-                }
-                Client::execute(&self.inner, query).await?;
-            }
-        }
-        handle.unlock().await?;
-        Ok(n)
+        let lock = ClickhouseLock::new(self.clone(), DEFAULT_LOCK_NAME);
+        execute_migrations(self, Some(lock), DEFAULT_LOCK_TTL, queries, str::to_string).await
     }
 }
 
 #[async_trait::async_trait]
-impl AsyncQuery<Vec<Migration>> for MigrationClient {
+impl AsyncQuery<Vec<Migration>> for Client {
     async fn query(
         &mut self,
         query: &str,
     ) -> Result<Vec<Migration>, <Self as AsyncTransaction>::Error> {
-        self.inner.query_collect::<Migration>(query).await
+        self.query_collect::<Migration>(query).await
     }
 }
 
-impl AsyncMigrate for MigrationClient {
+impl AsyncMigrate for Client {
     fn assert_migrations_table_query(migration_table_name: &str) -> String {
         format!(
             "CREATE TABLE IF NOT EXISTS {migration_table_name}(
@@ -210,76 +239,112 @@ impl AsyncMigrate for MigrationClient {
     }
 }
 
-pub trait ClusterName: Send + Sync {
-    fn cluster_name() -> String;
-    fn database() -> String;
-}
+#[async_trait::async_trait]
+impl AsyncTransaction for MigrationClient {
+    type Error = KlickhouseError;
 
-/// Wrapper for MigrationClient to use migrations on clusters
-pub struct ClusterMigration<T: ClusterName> {
-    client: MigrationClient,
-    _t: PhantomData<T>,
-}
-
-impl<T: ClusterName> ClusterMigration<T> {
-    pub fn new(client: MigrationClient) -> Self {
-        Self {
-            client,
-            _t: Default::default(),
-        }
+    async fn execute<'a, T: Iterator<Item = &'a str> + Send>(
+        &mut self,
+        queries: T,
+    ) -> Result<usize, Self::Error> {
+        execute_migrations(
+            &self.inner,
+            Some(self.lock()),
+            self.options.migration_lock_ttl,
+            queries,
+            str::to_string,
+        )
+        .await
     }
 }
 
 #[async_trait::async_trait]
-impl<TT: ClusterName> AsyncTransaction for ClusterMigration<TT> {
+impl AsyncQuery<Vec<Migration>> for MigrationClient {
+    async fn query(
+        &mut self,
+        query: &str,
+    ) -> Result<Vec<Migration>, <Self as AsyncTransaction>::Error> {
+        <Client as AsyncQuery<Vec<Migration>>>::query(&mut self.inner, query).await
+    }
+}
+
+impl AsyncMigrate for MigrationClient {
+    fn assert_migrations_table_query(migration_table_name: &str) -> String {
+        <Client as AsyncMigrate>::assert_migrations_table_query(migration_table_name)
+    }
+}
+
+/// Wrapper for Client to use migrations on clusters
+///
+/// Migrations may use the following placeholders:
+/// * `%DATABASE%`: the configured database
+/// * `%CLUSTER%`: the configured cluster name
+/// * `%ON_CLUSTER%`: `ON CLUSTER <cluster name>`
+///
+/// Migrations that only use `%DATABASE%` and `%ON_CLUSTER%` can be shared with [`LocalMigration`].
+pub struct ClusterMigration {
+    client: Client,
+    cluster_name: String,
+    database: String,
+    do_lock: bool,
+}
+
+impl ClusterMigration {
+    pub fn new(client: Client, cluster_name: String, database: String) -> Self {
+        Self {
+            client,
+            cluster_name,
+            database,
+            do_lock: true,
+        }
+    }
+
+    pub fn without_lock(mut self) -> Self {
+        self.do_lock = false;
+        self
+    }
+
+    fn substitute(&self, query: &str) -> String {
+        query
+            .replace("%ON_CLUSTER%", &format!("ON CLUSTER {}", self.cluster_name))
+            .replace("%DATABASE%", &self.database)
+            .replace("%CLUSTER%", &self.cluster_name)
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncTransaction for ClusterMigration {
     type Error = KlickhouseError;
     async fn execute<'a, T: Iterator<Item = &'a str> + Send>(
         &mut self,
         queries: T,
     ) -> Result<usize, Self::Error> {
-        let lock = ClickhouseLock::new(
-            self.client.inner.clone(),
-            &self.client.options.migration_lock_name,
-        )
-        .with_cluster(TT::cluster_name())
-        .with_sync(self.client.options.migration_lock_sync);
-        let start = Instant::now();
-        let handle = loop {
-            if let Some(handle) = lock.try_lock().await? {
-                break handle;
-            } else {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                if start.elapsed() > self.client.options.migration_lock_ttl {
-                    lock.reset().await?;
-                }
-            }
-        };
-        let mut n = 0;
-        for query in queries {
-            n += 1;
-            for query in query_parser::split_query_statements(query) {
-                Client::execute(&self.client.inner, query).await?;
-            }
-        }
-        handle.unlock().await?;
-        Ok(n)
+        let lock = self.do_lock.then(|| {
+            ClickhouseLock::new(self.client.clone(), DEFAULT_LOCK_NAME)
+                .with_cluster(&self.cluster_name)
+        });
+        execute_migrations(&self.client, lock, DEFAULT_LOCK_TTL, queries, |query| {
+            self.substitute(query)
+        })
+        .await
     }
 }
 
 #[async_trait::async_trait]
-impl<T: ClusterName> AsyncQuery<Vec<Migration>> for ClusterMigration<T> {
+impl AsyncQuery<Vec<Migration>> for ClusterMigration {
     async fn query(
         &mut self,
         query: &str,
     ) -> Result<Vec<Migration>, <Self as AsyncTransaction>::Error> {
-        <MigrationClient as AsyncQuery<Vec<Migration>>>::query(&mut self.client, query).await
+        let query = self.substitute(query);
+        <Client as AsyncQuery<Vec<Migration>>>::query(&mut self.client, &query).await
     }
 }
 
-impl<T: ClusterName> AsyncMigrate for ClusterMigration<T> {
+impl AsyncMigrate for ClusterMigration {
     fn assert_migrations_table_query(migration_table_name: &str) -> String {
         format!(
-            r"CREATE TABLE IF NOT EXISTS {migration_table_name}_local ON CLUSTER {0}(
+            r"CREATE TABLE IF NOT EXISTS {migration_table_name}_local ON CLUSTER %CLUSTER%(
                 version INT,
                 name VARCHAR(255),
                 applied_on VARCHAR(255),
@@ -287,11 +352,84 @@ impl<T: ClusterName> AsyncMigrate for ClusterMigration<T> {
             ) Engine=MergeTree() ORDER BY version;
             CREATE TABLE IF NOT EXISTS
                 {migration_table_name}
-            ON CLUSTER {0}
-            AS {migration_table_name}_local ENGINE = Distributed({0}, {1}, {migration_table_name}_local, rand());
+            ON CLUSTER %CLUSTER%
+            AS {migration_table_name}_local ENGINE = Distributed(%CLUSTER%, %DATABASE%, {migration_table_name}_local, rand());
             ",
-            T::cluster_name(),
-            T::database()
+        )
+    }
+}
+
+/// Wrapper for Client to use migrations on a single, non-clustered node
+///
+/// Accepts the same migrations as [`ClusterMigration`], with the following placeholders:
+/// * `%DATABASE%`: the configured database
+/// * `%ON_CLUSTER%`: removed
+///
+/// `%CLUSTER%` is left as-is, so migrations that reference a cluster directly (i.e. `Distributed` or
+/// `Replicated*` engines) cannot be shared and will fail.
+pub struct LocalMigration {
+    client: Client,
+    database: String,
+    do_lock: bool,
+}
+
+impl LocalMigration {
+    pub fn new(client: Client, database: String) -> Self {
+        Self {
+            client,
+            database,
+            do_lock: true,
+        }
+    }
+
+    pub fn without_lock(mut self) -> Self {
+        self.do_lock = false;
+        self
+    }
+
+    fn substitute(&self, query: &str) -> String {
+        query
+            .replace("%ON_CLUSTER%", "")
+            .replace("%DATABASE%", &self.database)
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncTransaction for LocalMigration {
+    type Error = KlickhouseError;
+    async fn execute<'a, T: Iterator<Item = &'a str> + Send>(
+        &mut self,
+        queries: T,
+    ) -> Result<usize, Self::Error> {
+        let lock = self
+            .do_lock
+            .then(|| ClickhouseLock::new(self.client.clone(), DEFAULT_LOCK_NAME));
+        execute_migrations(&self.client, lock, DEFAULT_LOCK_TTL, queries, |query| {
+            self.substitute(query)
+        })
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncQuery<Vec<Migration>> for LocalMigration {
+    async fn query(
+        &mut self,
+        query: &str,
+    ) -> Result<Vec<Migration>, <Self as AsyncTransaction>::Error> {
+        let query = self.substitute(query);
+        <Client as AsyncQuery<Vec<Migration>>>::query(&mut self.client, &query).await
+    }
+}
+
+impl AsyncMigrate for LocalMigration {
+    fn assert_migrations_table_query(migration_table_name: &str) -> String {
+        format!(
+            "CREATE TABLE IF NOT EXISTS {migration_table_name}(
+            version INT,
+            name VARCHAR(255),
+            applied_on VARCHAR(255),
+            checksum VARCHAR(255)) Engine=MergeTree() ORDER BY version;"
         )
     }
 }
