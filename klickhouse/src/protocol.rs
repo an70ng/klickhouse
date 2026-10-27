@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use uuid::Uuid;
 
-use crate::{block::Block, progress::Progress, KlickhouseError, Result};
+use crate::{KlickhouseError, Result, block::Block, progress::Progress};
 
 pub const DBMS_MIN_REVISION_WITH_CLIENT_INFO: u64 = 54032;
 pub const DBMS_MIN_REVISION_WITH_SERVER_TIMEZONE: u64 = 54058;
@@ -16,7 +16,7 @@ pub const DBMS_MIN_REVISION_WITH_VERSION_PATCH: u64 = 54401;
 // pub const DBMS_MIN_REVISION_WITH_COLUMN_DEFAULTS_METADATA: u64 = 54410;
 // pub const DBMS_MIN_REVISION_WITH_LOW_CARDINALITY_TYPE: u64 = 54405;
 pub const DBMS_MIN_REVISION_WITH_CLIENT_WRITE_INFO: u64 = 54420;
-// pub const DBMS_MIN_REVISION_WITH_SETTINGS_SERIALIZED_AS_STRINGS: u64 = 54429;
+pub const DBMS_MIN_REVISION_WITH_SETTINGS_SERIALIZED_AS_STRINGS: u64 = 54429;
 pub const DBMS_MIN_REVISION_WITH_OPENTELEMETRY: u64 = 54442;
 pub const DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET: u64 = 54441;
 // pub const DBMS_MIN_REVISION_WITH_X_FORWARDED_FOR_IN_CLIENT_INFO: u64 = 54443;
@@ -82,7 +82,7 @@ impl ServerPacketId {
             x => {
                 return Err(KlickhouseError::ProtocolError(format!(
                     "invalid packet id from server: {x}"
-                )))
+                )));
             }
         })
     }
